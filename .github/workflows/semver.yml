@@ -1,0 +1,37 @@
+# Reminds developers to bump the version of any package whose public API has
+# changed since its last registered release.  Fails the pull request until the
+# version in Project.toml is raised far enough — and passes silently once it is.
+name: Version bump
+
+on:
+  pull_request:
+    branches: [main, master]
+
+# Only the latest push to a pull request needs checking.
+concurrency:
+  group: semver-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  semver:
+    name: Check version bumps
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+
+      - uses: julia-actions/cache@v2
+
+      - name: Check that versions are bumped
+        run: |
+          julia --color=yes -e '
+            using Pkg
+            Pkg.activate(temp=true)
+            Pkg.add("SemverChecker")
+            using SemverChecker
+            exit(SemverChecker.main())' -- --summary
