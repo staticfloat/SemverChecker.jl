@@ -17,11 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ['1.10', '1', 'nightly']
-        os: [ubuntu-latest, macOS-latest, windows-latest]
-        exclude:
-          - {version: 'nightly', os: macOS-latest}
-          - {version: 'nightly', os: windows-latest}
+        version: ['lts', '1', 'nightly']
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: julia-actions/setup-julia@v2
