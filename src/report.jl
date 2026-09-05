@@ -79,7 +79,7 @@ function print_report(io::IO, reports::Vector{PackageReport}; verbose::Bool=fals
             end
         end
         if verbose
-            for e in r.parse_errors
+            for e in r.notes
                 println(io, "    ", _c("[note]", :yellow), " ", e)
             end
         end
@@ -205,7 +205,7 @@ function _json(r::PackageReport)
         "minimum_version" => r.minimum_version,
         "message" => r.message,
         "changes" => r.changes,
-        "notes" => r.parse_errors,
+        "notes" => r.notes,
     ])
 end
 

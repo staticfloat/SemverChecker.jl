@@ -1,16 +1,13 @@
 using Test, UUIDs
 using SemverChecker
 using SemverChecker: NoChange, Patch, Minor, Major, bump_version, is_sufficient,
-                     type_covers, covers, ConcreteSig, MethodSig, ArgSpec,
-                     expand_arities, normalize_type, compare_surfaces,
-                     extract_surface, discover_packages, public_names
+                     Change, overall_level, discover_packages, SemverWorker
 
 include("testutils.jl")
 
 @testset "SemverChecker" begin
 
 @testset "semver arithmetic" begin
-    # Post-1.0: the ordinary rules.
     @test bump_version(v"1.2.3", Major) == v"2.0.0"
     @test bump_version(v"1.2.3", Minor) == v"1.3.0"
     @test bump_version(v"1.2.3", Patch) == v"1.2.4"
@@ -20,8 +17,6 @@ include("testutils.jl")
     @test bump_version(v"0.4.2", Major) == v"0.5.0"
     @test bump_version(v"0.4.2", Minor) == v"0.4.3"
     @test bump_version(v"0.4.2", Patch) == v"0.4.3"
-
-    # 0.0.z: everything is potentially breaking.
     @test bump_version(v"0.0.7", Major) == v"0.0.8"
     @test bump_version(v"0.0.7", Minor) == v"0.0.8"
 
@@ -36,220 +31,213 @@ include("testutils.jl")
     # The conventional `-DEV` marker counts as the release it precedes.
     @test is_sufficient(v"1.2.3", v"1.3.0-DEV", Minor)
     @test !is_sufficient(v"1.2.3", v"1.3.0-DEV", Minor; allow_prerelease=false)
+
+    @test overall_level(Change[], false) == NoChange
+    @test overall_level(Change[], true) == Patch
 end
 
-@testset "type widening" begin
-    @test type_covers("Int", "Int")
-    @test type_covers("Any", "Int")
-    @test !type_covers("Int", "Any")
-    @test !type_covers("Int", "Integer")
-    @test type_covers("Union{Int,String}", "Int")
-    @test type_covers("Union{Int, String}", "String")
-    @test !type_covers("Union{Int,String}", "Float64")
-    @test type_covers("Union{Int,Union{String,Bool}}", "Bool")
-end
+@testset "real subtyping" begin
+    # The point of loading rather than parsing: widening an argument is not a
+    # breaking change, and only Julia's own subtyping knows Int <: Integer.
+    ch = apidiff(:(export f; f(x::Int) = x), :(export f; f(x::Integer) = x))
+    @test !haskind(ch, "method_removed")
+    @test haskind(ch, "method_added")
+    @test worst(ch) == "minor"
 
-@testset "signature coverage" begin
-    sig(ts...; va=nothing) = ConcreteSig(String[ts...], va)
-    @test covers(sig("Int"), sig("Int"))
-    @test covers(sig("Any"), sig("Int"))
-    @test !covers(sig("Int"), sig("Any"))
-    @test !covers(sig("Int", "Int"), sig("Int"))          # arity mismatch
-    @test covers(sig("Int"; va="Any"), sig("Int", "Bool")) # vararg absorbs extras
-    @test covers(sig(; va="Any"), sig("Int", "Bool"))
-    @test !covers(sig("Int"; va="Int"), sig("Int", "String"))
-end
+    # Narrowing is breaking, symmetrically.
+    ch = apidiff(:(export f; f(x::Integer) = x), :(export f; f(x::Int) = x))
+    @test haskind(ch, "method_removed")
+    @test worst(ch) == "major"
 
-@testset "arity expansion" begin
-    m = MethodSig([ArgSpec("Int", false, false), ArgSpec("Bool", true, false)],
-                  SemverChecker.KwSpec[], "f.jl", 1)
-    sigs = expand_arities(m)
-    @test length(sigs) == 2
-    @test sigs[1].types == ["Int"]
-    @test sigs[2].types == ["Int", "Bool"]
+    # Widening to a Union, and to Any.
+    ch = apidiff(:(export f; f(x::Int) = x), :(export f; f(x::Union{Int,String}) = x))
+    @test !haskind(ch, "method_removed")
+    ch = apidiff(:(export f; f(x::Int) = x), :(export f; f(x) = x))
+    @test !haskind(ch, "method_removed")
 
-    v = MethodSig([ArgSpec("Int", false, false), ArgSpec("Any", false, true)],
-                  SemverChecker.KwSpec[], "f.jl", 1)
-    @test expand_arities(v)[end].vararg == "Any"
-end
+    # An abstract supertype that still holds is not a break, even though the
+    # declared supertype changed: DenseVector <: AbstractVector.
+    ch = apidiff(:(export S; struct S <: AbstractVector{Int} end),
+                 :(export S; struct S <: DenseVector{Int} end))
+    @test !haskind(ch, "supertype_changed")
 
-@testset "type normalization" begin
-    @test normalize_type(:Int) == "Int"
-    @test normalize_type(:(Vector{Int})) == "Vector{Int}"
-    # `where` type variables are replaced by their bounds so that renaming a
-    # type variable does not read as an API change.
-    o, n = surfaces("export f\nf(x::T) where {T<:Integer} = x",
-                    "export f\nf(x::S) where {S<:Integer} = x")
-    @test isempty(compare_surfaces(o, n))
-end
+    # One that no longer holds is.
+    ch = apidiff(:(export S; struct S <: AbstractVector{Int} end),
+                 :(export S; struct S <: AbstractDict{Int,Int} end))
+    @test haskind(ch, "supertype_changed")
 
-@testset "extraction" begin
-    dir = mktempdir()
-    root = make_pkg(dir, "Ext", """
-        export foo, Bar, Baz, QUX, @mac
-        public helper
-
-        abstract type Baz end
-        struct Bar{T<:Real} <: Baz
-            a::Int
-            b::Vector{T}
-        end
-        Base.@kwdef struct Unexported
-            x::Int = 1
-        end
-        const QUX = 42
-        foo(x::Int, y::String="s"; z::Bool=false) = x
-        function foo(x::Float64) end
-        helper() = nothing
-        macro mac(x) end
-        @enum Color red green
-        include("more.jl")
-        """; files = Dict("src/more.jl" => "included_fn(x::Symbol) = x\nexport included_fn\n"))
-    s = extract_surface(root)
-
-    @test s.name == "Ext"
-    @test s.version == v"1.0.0"
-    @test :foo in s.exports && :Bar in s.exports && Symbol("@mac") in s.exports
-    @test :helper in s.publics
-    @test :included_fn in s.exports          # `include` was followed
-    @test haskey(s.functions, :included_fn)
-
-    @test s.types[:Bar].kind === :struct
-    @test s.types[:Bar].supertype == "Baz"
-    @test s.types[:Bar].params == ["Real"]
-    @test s.types[:Bar].fields == [(:a, "Int"), (:b, "Vector{Real}")]
-    @test s.types[:Baz].kind === :abstract
-    @test s.types[:Unexported].fields == [(:x, "Int")]   # @kwdef default stripped
-
-    @test length(s.functions[:foo]) == 2
-    @test haskey(s.macros, Symbol("@mac"))
-    @test s.consts[:QUX].name == :QUX
-    @test haskey(s.types, :Color) && haskey(s.consts, :red)
-    @test isempty(s.parse_errors)
+    # Renaming a type parameter is not a change at all.
+    ch = apidiff(:(export f; f(x::T) where {T<:Integer} = x),
+                 :(export f; f(x::S) where {S<:Integer} = x))
+    @test isempty(ch)
 end
 
 @testset "major changes" begin
-    # An exported name disappears.
-    lvl, ch = diff_level("export f, g\nf(x) = x\ng(x) = x", "export f\nf(x) = x")
-    @test lvl == Major && has_kind(ch, :export_removed)
+    ch = apidiff(:(export f, g; f(x) = x; g(x) = x), :(export f; f(x) = x))
+    @test haskind(ch, "export_removed") && worst(ch) == "major"
 
-    # An argument type narrows.
-    lvl, ch = diff_level("export f\nf(x) = x", "export f\nf(x::Int) = x")
-    @test lvl == Major && has_kind(ch, :method_removed)
+    ch = apidiff(:(export f; f(x::Int) = x; f(x::String) = x), :(export f; f(x::Int) = x))
+    @test haskind(ch, "method_removed")
 
-    # A method is dropped entirely.
-    lvl, ch = diff_level("export f\nf(x::Int) = x\nf(x::String) = x", "export f\nf(x::Int) = x")
-    @test lvl == Major && has_kind(ch, :method_removed)
+    # A type named by a released signature no longer exists at all.
+    ch = apidiff(:(export f, T; struct T end; f(x::T) = x),
+                 :(export f; f(x::Int) = x))
+    @test haskind(ch, "signature_unresolvable")
 
-    # Struct layout changes.
-    lvl, ch = diff_level("export S\nstruct S\n a::Int\n b::Int\nend",
-                         "export S\nstruct S\n a::Int\nend")
-    @test lvl == Major && has_kind(ch, :field_removed)
+    ch = apidiff(:(export S; struct S; a::Int; b::Int; end),
+                 :(export S; struct S; a::Int; end))
+    @test haskind(ch, "field_removed")
 
-    lvl, ch = diff_level("export S\nstruct S\n a::Int\nend",
-                         "export S\nstruct S\n a::Int\n b::Int\nend")
-    @test lvl == Major && has_kind(ch, :field_added)
+    ch = apidiff(:(export S; struct S; a::Int; end),
+                 :(export S; struct S; a::Int; b::Int; end))
+    @test haskind(ch, "field_added")
 
-    lvl, ch = diff_level("export S\nstruct S\n a::Int\nend",
-                         "export S\nstruct S\n a::Float64\nend")
-    @test lvl == Major && has_kind(ch, :field_type_changed)
+    ch = apidiff(:(export S; struct S; a::Int; b::Int; end),
+                 :(export S; struct S; b::Int; a::Int; end))
+    @test haskind(ch, "fields_reordered")
 
-    lvl, ch = diff_level("export S\nstruct S\n a::Int\n b::Int\nend",
-                         "export S\nstruct S\n b::Int\n a::Int\nend")
-    @test lvl == Major && has_kind(ch, :fields_reordered)
+    ch = apidiff(:(export S; struct S; a::Int; end),
+                 :(export S; struct S; a::Float64; end))
+    @test haskind(ch, "field_type_changed")
 
-    lvl, ch = diff_level("export S\nstruct S\n a::Int\nend",
-                         "export S\nmutable struct S\n a::Int\nend")
-    @test lvl == Major && has_kind(ch, :mutability_changed)
+    # The report says which direction a field moved.
+    ch = apidiff(:(export S; struct S; a::Int; end),
+                 :(export S; struct S; a::Union{Nothing,Int}; end))
+    @test occursin("widened", detail(ch, "field_type_changed"))
 
-    lvl, ch = diff_level("export S\nabstract type P end\nstruct S <: P\n a::Int\nend",
-                         "export S\nabstract type P end\nstruct S\n a::Int\nend")
-    @test lvl == Major && has_kind(ch, :supertype_changed)
+    ch = apidiff(:(export S; struct S; a::Int; end),
+                 :(export S; mutable struct S; a::Int; end))
+    @test haskind(ch, "mutability_changed")
 
-    # A const becomes a type.
-    lvl, ch = diff_level("export D\nconst D = Int", "export D\nstruct D\n x::Int\nend")
-    @test lvl == Major && has_kind(ch, :kind_changed)
+    ch = apidiff(:(export S; struct S{T}; a::T; end),
+                 :(export S; struct S{T,U}; a::T; end))
+    @test haskind(ch, "type_params_changed")
 
-    # Keyword arguments.
-    lvl, ch = diff_level("export f\nf(x; a=1) = x", "export f\nf(x) = x")
-    @test lvl == Major && has_kind(ch, :kwarg_removed)
+    ch = apidiff(:(export f; f(x; a=1) = x), :(export f; f(x) = x))
+    @test haskind(ch, "kwarg_removed")
 
-    lvl, ch = diff_level("export f\nf(x) = x", "export f\nf(x; a) = x")
-    @test lvl == Major && has_kind(ch, :kwarg_added)
+    ch = apidiff(:(export C; const C = 1), :(export C; const C = "s"))
+    @test haskind(ch, "const_type_changed")
 
-    lvl, ch = diff_level("export f\nf(x; a=1) = x", "export f\nf(x; a) = x")
-    @test lvl == Major && has_kind(ch, :kwarg_required)
+    # A function that became a type.
+    ch = apidiff(:(export D; D(x) = x), :(export D; struct D; x::Int; end))
+    @test haskind(ch, "kind_changed")
+
+    # A union alias that narrowed.
+    ch = apidiff(:(export U; const U = Union{Int,String}),
+                 :(export U; const U = Union{Int,Float64}))
+    @test haskind(ch, "union_changed") && worst(ch) == "major"
+
+    # Collapsing a union to a concrete type is a change of form.
+    ch = apidiff(:(export U; const U = Union{Int,String}), :(export U; const U = Int))
+    @test haskind(ch, "type_form_changed") && worst(ch) == "major"
 end
 
 @testset "minor changes" begin
-    # A newly exported name.
-    lvl, ch = diff_level("export f\nf(x) = x", "export f, g\nf(x) = x\ng(x) = x")
-    @test lvl == Minor && has_kind(ch, :export_added)
+    ch = apidiff(:(export f; f(x) = x), :(export f, g; f(x) = x; g(x) = x))
+    @test haskind(ch, "export_added") && worst(ch) == "minor"
 
-    # A new method on an existing exported function.
-    lvl, ch = diff_level("export f\nf(x::Int) = x", "export f\nf(x::Int) = x\nf(x::String) = x")
-    @test lvl == Minor && has_kind(ch, :method_added)
+    ch = apidiff(:(export f; f(x::Int) = x), :(export f; f(x::Int) = x; f(x::String) = x))
+    @test haskind(ch, "method_added") && worst(ch) == "minor"
 
-    # A new optional keyword argument.
-    lvl, ch = diff_level("export f\nf(x) = x", "export f\nf(x; a=1) = x")
-    @test lvl == Minor && has_kind(ch, :kwarg_added)
+    ch = apidiff(:(export f; f(x) = x), :(export f; f(x; a=1) = x))
+    @test haskind(ch, "kwarg_added") && worst(ch) == "minor"
 
-    # A new type.
-    lvl, ch = diff_level("export S\nstruct S end", "export S, T\nstruct S end\nstruct T end")
-    @test lvl == Minor
+    # A union alias that only grew still accepts everything it used to.
+    ch = apidiff(:(export U; const U = Union{Int,String}),
+                 :(export U; const U = Union{Int,String,Float64}))
+    @test haskind(ch, "union_widened") && worst(ch) == "minor"
 
-    # A new method is reported at the line it is written on, not at the first
-    # method of the function.
-    lvl, ch = diff_level("export f\nf(x::Int) = x",
-                         "export f\nf(x::Int) = x\n\n\nf(x::String) = x")
-    added = only(filter(c -> c.kind === :method_added, ch))
-    @test added.location == "src/Fixture.jl:6"
+    # An added default argument keeps every old arity.
+    ch = apidiff(:(export f; f(x) = x), :(export f; f(x, y=1) = x))
+    @test !haskind(ch, "method_removed") && worst(ch) == "minor"
 end
 
-@testset "patch and no change" begin
-    # Internals moved around; the exported surface is identical.
-    lvl, ch = diff_level("export f\nf(x) = x\ninternal(y) = y",
-                         "export f\nf(x) = x\ninternal(y) = 2y")
-    @test lvl == Patch && isempty(ch)
+@testset "no public change" begin
+    body = :(export f; f(x) = x; internal(y) = y)
+    @test isempty(apidiff(body, body))
 
-    # A new *unexported* function is still only a patch.
-    lvl, ch = diff_level("export f\nf(x) = x", "export f\nf(x) = x\nhidden(y) = y")
-    @test lvl == Patch && isempty(ch)
+    # Internal churn is invisible.
+    @test isempty(apidiff(:(export f; f(x) = x; hidden(y) = y),
+                          :(export f; f(x) = x; hidden(y) = 2y; other() = 1)))
 
-    # Byte-identical source needs no bump at all.
-    o, n = surfaces("export f\nf(x) = x", "export f\nf(x) = x")
-    @test o.source_hash == n.source_hash
-    @test SemverChecker.overall_level(compare_surfaces(o, n), false) == NoChange
+    # An unexported type may change freely.
+    @test isempty(apidiff(:(export f; struct H; a::Int; end; f(x) = x),
+                          :(export f; struct H; a::Float64; b::Int; end; f(x) = x)))
 end
 
-@testset "widening is not breaking" begin
-    # Loosening an argument type keeps every old call working.
-    lvl, ch = diff_level("export f\nf(x::Int) = x", "export f\nf(x) = x")
-    @test lvl == Minor          # strictly more calls accepted: a new method
-    @test !has_kind(ch, :method_removed)
-
-    lvl, ch = diff_level("export f\nf(x::Int) = x", "export f\nf(x::Union{Int,String}) = x")
-    @test !has_kind(ch, :method_removed)
-
-    # Adding a defaulted positional argument keeps the old arity.
-    lvl, ch = diff_level("export f\nf(x) = x", "export f\nf(x, y=1) = x")
-    @test lvl == Minor && !has_kind(ch, :method_removed)
+@testset "reexported names are part of the surface" begin
+    # The gap that static analysis cannot close: a name this module never
+    # defines, but does export, still belongs to its API.
+    ch = apidiff(:(using Test; export detect_ambiguities, f; f() = 1),
+                 :(export f; f() = 1))
+    @test haskind(ch, "export_removed")
+    @test detail(ch, "export_removed") == "`detect_ambiguities` is no longer public"
 end
 
-@testset "internal churn is invisible" begin
-    # Unexported types may change freely.
-    lvl, ch = diff_level("struct Hidden\n a::Int\nend", "struct Hidden\n a::Float64\n b::Int\nend")
-    @test lvl == Patch && isempty(ch)
+@testset "public submodules" begin
+    # A public submodule's exports are reachable as Package.Inner.thing.
+    old = :(module Inner; export g; g(x::Int) = x; end; export Inner)
+    new = :(module Inner; export g; g(x::String) = x; end; export Inner)
+    ch = apidiff(old, new)
+    @test any(c -> c["name"] == "Inner.g", ch)
+    @test haskind(ch, "method_removed")
+end
+
+@testset "method ownership" begin
+    @test SemverWorker.is_stdlib_module(Base) && SemverWorker.is_stdlib_module(Core)
+    @test SemverWorker.is_stdlib_module(Base.Sys)
+    @test !SemverWorker.is_stdlib_module(SemverChecker)
+
+    # A package sees itself and anything it has bound; not unrelated modules.
+    @test SemverWorker.is_visible_from(SemverChecker, SemverChecker)
+    @test SemverWorker.is_visible_from(SemverChecker.SemverWorker, SemverChecker)
+    @test !SemverWorker.is_visible_from(Test, SemverChecker)
+
+    # Extending a Base function is the package's own API; Base's own methods
+    # for it are not.
+    ch = apidiff(:(export mysize; Base.size(x::Int, y::Int) = 0; mysize() = 1),
+                 :(export mysize; mysize() = 1))
+    @test !haskind(ch, "method_removed")   # `size` was never exported here
+end
+
+@testset "signature rendering" begin
+    p = SemverWorker._pretty
+    @test p("Tuple{typeof(Foo.bar), Core.Int64, Core.String}") == "Foo.bar(Int64, String)"
+    @test p("Tuple{typeof(Foo.g)}") == "Foo.g()"
+    @test p("Tuple{typeof(Foo.f), Base.Vector{T}} where T<:Core.Real") ==
+          "Foo.f(Vector{T}) where T<:Real"
+    @test p("Union{Nothing, M.SHA1Hash}") == "Union{Nothing, M.SHA1Hash}"
+end
+
+@testset "source hashing" begin
+    uuid = "11111111-1111-1111-1111-111111111111"
+    d1, d2 = mktempdir(), mktempdir()
+    a = make_pkg(d1, "H", "f() = 1"; uuid, version="1.0.0")
+    b = make_pkg(d2, "H", "f() = 1"; uuid, version="9.9.9")
+    # Identical sources differing only in `version` hash the same: bumping the
+    # version must not by itself make a package look changed.
+    @test SemverWorker.source_hash(a) == SemverWorker.source_hash(b)
+
+    write(joinpath(b, "src", "H.jl"), "module H\nf() = 2\nend\n")
+    @test SemverWorker.source_hash(a) != SemverWorker.source_hash(b)
+
+    # Compat bounds are part of the package, so changing them does count.
+    write(joinpath(b, "src", "H.jl"), "module H\nf() = 1\nend\n")
+    @test SemverWorker.source_hash(a) == SemverWorker.source_hash(b)
+    open(joinpath(b, "Project.toml"), "a") do io
+        println(io, "\n[compat]\njulia = \"1.10\"")
+    end
+    @test SemverWorker.source_hash(a) != SemverWorker.source_hash(b)
 end
 
 @testset "discovery" begin
     dir = mktempdir()
-    make_pkg(dir, "A", "export a\na() = 1")
-    make_pkg(joinpath(dir, "nested"), "B", "export b\nb() = 1")
+    make_pkg(dir, "A", "export a; a() = 1")
+    make_pkg(joinpath(dir, "nested"), "B", "export b; b() = 1")
     # A test environment is a project but not a package, and must be ignored.
     mkpath(joinpath(dir, "A", "test"))
     write(joinpath(dir, "A", "test", "Project.toml"), "[deps]\n")
-    # A docs environment likewise.
     mkpath(joinpath(dir, "docs"))
     write(joinpath(dir, "docs", "Project.toml"), "[deps]\n")
 
@@ -259,64 +247,49 @@ end
 end
 
 @testset "reporting" begin
+    rv = SemverChecker.RegisteredVersion("Demo", UUIDs.uuid4(), v"1.0.0", "General")
     reports = [SemverChecker.PackageReport(
-        "Demo", "Demo", v"1.0.0",
-        SemverChecker.RegisteredVersion("Demo", UUIDs.uuid4(), v"1.0.0", "abc", "General", nothing, nothing),
-        Major,
-        [SemverChecker.Change(Major, :export_removed, :gone, "`gone` is no longer exported", "src/Demo.jl:3")],
+        "Demo", "Demo", v"1.0.0", rv, Major,
+        [Change(Major, :export_removed, :gone, "`gone` is no longer public", "src/Demo.jl:3")],
         v"2.0.0", :needs_bump, "", String[])]
 
     text = sprint(io -> SemverChecker.print_report(io, reports))
     @test occursin("bump version to at least 2.0.0", text)
-    @test occursin("no longer exported", text)
+    @test occursin("no longer public", text)
 
     gha = sprint(io -> SemverChecker.print_github_annotations(io, reports))
     @test startswith(gha, "::error file=Demo/Project.toml,line=")
     @test occursin("%0A", gha)             # newlines are escaped for the runner
 
     md = sprint(io -> SemverChecker.print_markdown(io, reports))
-    @test occursin("| `Demo` |", md)
-    @test occursin("**≥ 2.0.0**", md)
+    @test occursin("| `Demo` |", md) && occursin("**≥ 2.0.0**", md)
 
     json = sprint(io -> SemverChecker.print_json(io, reports))
-    @test occursin("\"ok\":false", json)
-    @test occursin("\"minimum_version\":\"2.0.0\"", json)
-end
-
-@testset "reports for unusual packages" begin
-    dir = mktempdir()
-    # No `version` field at all.
-    root = make_pkg(dir, "NoVer", "export f\nf() = 1")
-    write(joinpath(root, "Project.toml"),
-          "name = \"NoVer\"\nuuid = \"$(UUIDs.uuid4())\"\n")
-    r = SemverChecker.check_package(root)
-    @test r.status === :no_version
-
-    # A package with a UUID nobody has registered.
-    root2 = make_pkg(dir, "DefinitelyNotRegistered$(rand(UInt32))", "export f\nf() = 1")
-    r2 = SemverChecker.check_package(root2)
-    @test r2.status === :unregistered
+    @test occursin("\"ok\":false", json) && occursin("\"minimum_version\":\"2.0.0\"", json)
 end
 
 @testset "apply_bumps!" begin
     dir = mktempdir()
-    root = make_pkg(dir, "Fix", "export f\nf() = 1"; version="1.0.0")
+    root = make_pkg(dir, "Fix", "export f; f() = 1"; version="1.0.0")
     reports = [SemverChecker.PackageReport(
-        "Fix", "Fix", v"1.0.0", nothing, Minor, SemverChecker.Change[],
+        "Fix", "Fix", v"1.0.0", nothing, Minor, Change[],
         v"1.1.0", :needs_bump, "", String[])]
-    changed = SemverChecker.apply_bumps!(reports; root=dir)
-    @test length(changed) == 1
+    @test length(SemverChecker.apply_bumps!(reports; root=dir)) == 1
     @test occursin("version = \"1.1.0\"", read(joinpath(root, "Project.toml"), String))
 end
 
 @testset "cli" begin
     @test SemverChecker.main(["--help"]) == 0
     @test SemverChecker.main(["--nonsense"]) == 2
+end
 
-    dir = mktempdir()
-    make_pkg(dir, "CliDemo$(rand(UInt32))", "export f\nf() = 1")
-    # Unregistered packages must not fail the build.
-    @test SemverChecker.main(["--format=json", dir]) == 0
+# The full two-subprocess path needs a registry and a package server.
+if get(ENV, "SEMVERCHECKER_INTEGRATION", "") == "true"
+    @testset "end to end" begin
+        reports = SemverChecker.check(dirname(@__DIR__))
+        @test length(reports) == 1
+        @test reports[1].name == "SemverChecker"
+    end
 end
 
 end # testset

@@ -4,9 +4,14 @@ SemverChecker is designed to run on pull requests as a reminder: it fails the
 job while a package's `Project.toml` still claims a version that its changes
 have outgrown, and passes as soon as the developer bumps it.
 
-It needs no dependency resolution and does not load your package, so the job is
-fast (a few seconds for a repository of a dozen packages) and does not need your
-test environment.
+It works by loading both the released version and the working tree and comparing
+them with real Julia dispatch, so the job needs to install and load your
+packages. Two things follow, and both are addressed below:
+
+- **Cache the depot.** With `julia-actions/cache@v2` the whole check runs in
+  seconds; without it, the released versions are downloaded and precompiled from
+  scratch every run.
+- **The job needs registry and package-server access**, like any `Pkg.add`.
 
 ---
 
@@ -250,9 +255,10 @@ Three verdicts are informational rather than failures:
 - `unregistered` — the package is not in any reachable registry, so there is
   nothing to compare against. New packages sit here until their first release.
 - `no_version` — `Project.toml` has no `version` field.
-- `error` — the released source could not be fetched, or the working tree could
-  not be parsed. The message says which. These surface as `::warning`
-  annotations on GitHub so an outage in the package server does not fail your
+- `error` — the released version could not be installed or loaded, or the
+  working tree could not be. The message says which, and `--logdir` keeps the
+  subprocess output that explains it. These surface as `::warning` annotations on
+  GitHub, so an unloadable package or a package-server outage does not fail your
   build.
 
 ### Registries other than General
@@ -271,7 +277,40 @@ Add it before running the check, in the same job.
 
 ### Caching
 
-The released source of each package is downloaded from the package server on
-every run. `julia-actions/cache@v2` keeps the depot warm between runs, and
-SemverChecker uses an already-installed copy of a release when the depot has one
-at the matching tree hash, skipping the download entirely.
+Caching is worth more here than in most jobs, because the released versions are
+installed and precompiled as well as the working tree. Measured on
+BinaryBuilder2's thirteen packages:
+
+| | released side | working tree | total |
+|---|---|---|---|
+| Warm depot (`julia-actions/cache`) | ~3s | ~1s | **~15s** |
+| Cold depot | ~155s, 2.6GB | ~46s | ~3.5min |
+
+Always include the cache step:
+
+```yaml
+      - uses: julia-actions/cache@v2
+```
+
+If the same workflow also runs your tests, put the check in the *same* job as
+the tests so the working tree is precompiled only once.
+
+### When a package will not load
+
+A package that cannot be resolved or loaded — on either side — is reported as an
+error rather than a verdict, and the other packages still get theirs. The
+subprocess output explains why; keep it with `--logdir` and upload it:
+
+```yaml
+      - name: Check that versions are bumped
+        run: |
+          julia --color=yes -e '
+            using Pkg; Pkg.activate(temp=true); Pkg.add("SemverChecker")
+            using SemverChecker; exit(SemverChecker.main())' -- --summary --logdir=semver-logs
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: semver-logs
+          path: semver-logs/
+```

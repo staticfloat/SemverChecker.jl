@@ -13,6 +13,7 @@ Options:
     --format=FMT          auto | text | github | markdown | json  (default: auto)
     --summary             Also append a Markdown report to \$GITHUB_STEP_SUMMARY
     --fix                 Rewrite Project.toml versions to the minimum acceptable
+    --logdir=DIR          Keep the analysis subprocess logs here
     --skip=NAME           Directory name to skip during discovery; repeatable
     --no-prerelease       Do not treat "1.2.0-DEV" as satisfying a bump to 1.2.0
     --verbose             Show packages that are already fine, and analysis notes
@@ -35,6 +36,7 @@ function main(args::AbstractVector{<:AbstractString}=ARGS)
     opts = Dict{String,Any}(
         "path" => ".", "format" => "auto", "fix" => false, "verbose" => false,
         "summary" => false, "exit_zero" => false, "allow_prerelease" => true,
+        "logdir" => nothing,
     )
     packages = String[]
     skips = copy(DEFAULT_SKIP)
@@ -55,6 +57,8 @@ function main(args::AbstractVector{<:AbstractString}=ARGS)
             opts["allow_prerelease"] = false
         elseif startswith(a, "--path=")
             opts["path"] = a[8:end]
+        elseif startswith(a, "--logdir=")
+            opts["logdir"] = a[10:end]
         elseif startswith(a, "--format=")
             opts["format"] = a[10:end]
         elseif startswith(a, "--package=")
@@ -73,10 +77,12 @@ function main(args::AbstractVector{<:AbstractString}=ARGS)
     root = abspath(opts["path"])
     isdir(root) || (println(stderr, "no such directory: $(root)"); return 2)
 
+    logdir = opts["logdir"] === nothing ? mktempdir() : opts["logdir"]
     reports = check(root;
                     packages = isempty(packages) ? nothing : packages,
                     skip = skips,
-                    allow_prerelease = opts["allow_prerelease"])
+                    allow_prerelease = opts["allow_prerelease"],
+                    logdir = logdir)
 
     if isempty(reports)
         println(stderr, "no Julia packages found under $(root)")
@@ -106,6 +112,12 @@ function main(args::AbstractVector{<:AbstractString}=ARGS)
                 print_markdown(io, reports)
             end
         end
+    end
+
+    # A package that could not be loaded is usually explained by the subprocess
+    # log, so point at it rather than leaving the user to guess.
+    if any(r -> r.status === :error, reports)
+        println(stderr, "\nanalysis logs: $(logdir)")
     end
 
     if opts["fix"]

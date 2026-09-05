@@ -8,8 +8,8 @@ how far the version in `Project.toml` needs to be bumped:
 
 | Verdict   | What it means                                                                   |
 |-----------|---------------------------------------------------------------------------------|
-| **major** | A public name disappeared, a method no longer accepts arguments it used to, or an exported type's layout changed. |
-| **minor** | New public names, new methods on existing public functions, or new optional keyword arguments. |
+| **major** | A public name disappeared, a method no longer accepts arguments it used to, or a public type's layout or supertype changed. |
+| **minor** | New public names, new methods, new keyword arguments, or a widened union.        |
 | **patch** | The source changed but the public surface did not.                              |
 | *none*    | Nothing changed since the release. No bump needed; nothing is reported.          |
 
@@ -18,21 +18,39 @@ The goal is to nudge during development, not to nag.
 
 ## How it works
 
-Both surfaces — the released one and your working tree — are recovered by
-**parsing the source**. Nothing is loaded, instantiated or executed, which means:
+SemverChecker **loads** both the released version and your working tree, in two
+subprocesses, and compares their API surfaces using **real Julia dispatch**.
 
-- no dependency resolution for the old version (often impossible for old releases);
-- no need for your package to even be loadable on the CI machine;
-- the whole scan takes a few seconds for a dozen packages.
+Two versions of a package cannot coexist in one session, so each side gets its
+own process. Every package in the repository is resolved into a *single*
+environment per side, so a thirteen-package monorepo costs two loads in total,
+not twenty-six.
 
-The released source comes from the registry's recorded tree hash, fetched from
-your package server (or from an already-installed copy in the depot, for free).
+Signatures are recorded fully qualified (`Tuple{typeof(Foo.bar),
+Core.Int64}`), which makes them re-evaluable in the other process. The question
+"is this still a breaking change?" then becomes a question Julia itself
+answers:
 
-Because it is static analysis, the type reasoning is deliberately conservative:
-widening an argument to `Any` or growing a `Union` is recognised as
-non-breaking, and anything else that changes is reported for a human to judge.
-A false *major* costs you a glance at the report; a missed break costs a broken
-release.
+```julia
+S_old = Core.eval(scope, :(Tuple{typeof(Foo.bar), Core.Int64}))
+any(m -> S_old <: m.sig, methods(Foo.bar))   # still dispatched?
+```
+
+Because this is the real dispatch rule, widening is recognised without any
+special-casing: `f(::Int)` → `f(::Integer)` is not a break, `f(::Integer)` →
+`f(::Int)` is, and no table of hand-written subtyping rules is involved.
+
+Loading rather than parsing buys three things that reading source cannot:
+
+- **Reexports are visible.** `names(M)` is the real answer. BinaryBuilder2
+  exports 117 names, of which only 30 are defined in BinaryBuilder2 itself; the
+  rest are reexported from sibling packages. Across that monorepo, 352 names are
+  exported and only 140 are defined in their own package — **60% of the public
+  API is reexported**, and every bit of it is invisible to source analysis.
+- **Generated code is visible.** Methods and types produced by `@eval` loops,
+  `@kwdef`, `@enum` or any other macro are simply there in the method table.
+- **Aliases are resolved.** `const HashOrString = Union{String,MultiHash}`
+  is compared as the union it denotes, not as the seven characters of its name.
 
 ## Installation
 
@@ -45,14 +63,13 @@ pkg> add SemverChecker
 ```console
 $ julia -e 'using SemverChecker; exit(SemverChecker.main())' -- .
 ✗ BinaryBuilder2: bump version to at least 2.0.0 (currently 1.0.1, released 1.0.1, detected major change)
-    [major] `Dependency` changed from a const to a type  (src/Compat.jl:13)
-    [major] `BuildResult.log_artifact` type changed: `SHA1Hash` → `Union{Nothing, SHA1Hash}`  (src/build_api/BuildResult.jl:4)
-    [major] `BuildMeta` lost field `json_output::Union{Nothing, IO}`  (src/build_api/BuildMeta.jl:218)
-    [major] `BuildMeta` gained field `archive_dir::Union{Nothing, String}` (changes layout and the default constructor)  (src/build_api/BuildMeta.jl:218)
+    [major] `BuildResult.log_artifact` type changed: `MultiHashParsing.SHA1Hash` → `Union{Nothing, MultiHashParsing.SHA1Hash}` (widened)
+    [major] `BuildMeta` lost field `json_output::Union{Nothing, IO}`
+    [major] `BuildMeta` gained field `archive_dir::Union{Nothing, String}` (changes the layout and the default constructor)
 ✓ BinaryBuilderGitUtils: unchanged since v0.2.0
 ✗ ScratchSpaceGarbageCollector: bump version to at least 0.1.2 (currently 0.1.1, released 0.1.1, detected patch change)
 
-2 of 13 package(s) need a version bump.
+3 of 13 package(s) need a version bump.
 ```
 
 Exit status is `1` when at least one package needs a bump, `0` otherwise.
@@ -66,6 +83,7 @@ Exit status is `1` when at least one package needs a bump, `0` otherwise.
 | `--format=FMT` | `auto`, `text`, `github`, `markdown`, `json` |
 | `--summary` | Append a Markdown report to `$GITHUB_STEP_SUMMARY` |
 | `--fix` | Rewrite `Project.toml` versions to the minimum acceptable |
+| `--logdir=DIR` | Keep the subprocess logs here (default: a temporary directory) |
 | `--skip=NAME` | Directory name to skip during discovery; repeatable |
 | `--no-prerelease` | Do not treat `1.2.0-DEV` as satisfying a bump to `1.2.0` |
 | `--verbose` | Also show packages that are already fine |
@@ -91,14 +109,53 @@ for r in reports
 end
 ```
 
-`check_package(dir)` runs a single package. Each `PackageReport` has a `status`
-of `:ok`, `:needs_bump`, `:unregistered` (nothing to compare against),
-`:no_version`, or `:error`.
+Each `PackageReport` has a `status` of `:ok`, `:needs_bump`, `:unregistered`
+(nothing to compare against), `:no_version`, or `:error`.
+
+## What this costs
+
+The released versions have to be installed and both sides have to be loaded.
+Measured on BinaryBuilder2's thirteen packages:
+
+| | released side | working tree |
+|---|---|---|
+| Warm depot | ~3s | ~1s |
+| Cold depot | ~155s, 2.6GB | ~46s |
+
+The whole check is ~15s on a warm depot. A cold depot is the honest worst case,
+and BinaryBuilder2 is unusually heavy — it pulls JLL binary artifacts. In CI,
+`julia-actions/cache@v2` keeps the depot warm, and the test job already pays the
+cost of loading the working tree.
+
+## Requirements and limitations
+
+The check needs to actually load your code, which implies:
+
+- **Both sides must resolve and load.** If the released version or the working
+  tree cannot be installed or loaded, that package reports `:error` with the
+  reason rather than a verdict. Other packages are unaffected. If the whole set
+  cannot resolve together, SemverChecker retries one environment per package.
+- **Package code runs.** `__init__` and precompilation execute, as they do for
+  your test job. Output is captured into the subprocess logs (`--logdir`) rather
+  than interleaved with the report.
+- **A registry and the released source are needed**, so CI must be able to reach
+  its package server.
+
+Two things are deliberately out of reach:
+
+- **Required vs optional keyword arguments.** The method table records keyword
+  *names* but not their defaults, so a newly *required* keyword is reported as
+  `minor`, not `major`.
+- **Methods from modules the package cannot see.** A generic function is shared
+  by everyone who extends it, so `methods(f)` includes methods from unrelated
+  co-loaded packages. Only methods defined by the package itself or by something
+  it has bound (`using Foo` — which is what makes reexports work) count as its
+  surface.
 
 ## Prerelease versions
 
 The Julia convention of marking in-development versions as `1.3.0-DEV` is
-honoured by default: a `-DEV` suffix is ignored when checking whether the bump is
+honoured by default: the suffix is ignored when checking whether the bump is
 large enough, so `1.3.0-DEV` satisfies a required minor bump to `1.3.0`. Pass
 `--no-prerelease` for strict comparison.
 
@@ -116,40 +173,10 @@ breaking one, and SemverChecker follows suit:
 | `0.4.2` | minor | `0.4.3` |
 | `0.0.7` | *any*  | `0.0.8` |
 
-## What is and is not detected
-
-**Detected:** removed or added exports and `public` declarations; removed,
-narrowed or added methods (including arities produced by default arguments and
-`Vararg`); keyword arguments added, removed or made required; struct fields
-added, removed, reordered or retyped; mutability, supertype and type-parameter
-changes; `const` type changes; `@enum` definitions; extensions of foreign
-functions that the package re-exports (`Base.push!`); definitions reached
-through `include` and inside `ext/`.
-
-**Not detected:** the *signatures* of names that are reexported from a
-dependency (`@reexport using Foo`) or generated at runtime by `@eval` loops —
-they are not defined in the package's own source, so there is nothing to read.
-Such names are still compared by name, so dropping one is still caught as a
-major change. Behavioural changes that leave signatures intact are also
-invisible, by construction.
-
-`--verbose` lists exactly what could not be analyzed, per package, so the blind
-spots are never silent:
-
-```
-✓ MLJ: unchanged since v0.20.7
-    [note] 165 of 168 public name(s) are not defined in this package
-           (reexported or generated); compared by name only: …
-    [note] `@eval` block at src/loading.jl:41 not analyzed statically
-```
-
-Only names the package `export`s or declares `public` are compared. Internal
-churn never triggers more than a patch.
-
 ## Documentation
 
 - [Using SemverChecker in CI](docs/src/ci.md) — GitHub Actions, GitLab CI,
-  Buildkite, and pre-commit.
+  Buildkite, and pre-push hooks.
 
 ## License
 
