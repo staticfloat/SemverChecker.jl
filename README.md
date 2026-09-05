@@ -8,7 +8,7 @@ how far the version in `Project.toml` needs to be bumped:
 
 | Verdict   | What it means                                                                   |
 |-----------|---------------------------------------------------------------------------------|
-| **major** | A public name disappeared, a method no longer accepts arguments it used to, or a public type's layout or supertype changed. |
+| **major** | A public name disappeared, or a method or constructor no longer accepts arguments it used to. |
 | **minor** | New public names, new methods, new keyword arguments, or a widened union.        |
 | **patch** | The source changed but the public surface did not.                              |
 | *none*    | Nothing changed since the release. No bump needed; nothing is reported.          |
@@ -51,6 +51,43 @@ Loading rather than parsing buys three things that reading source cannot:
   `@kwdef`, `@enum` or any other macro are simply there in the method table.
 - **Aliases are resolved.** `const HashOrString = Union{String,MultiHash}`
   is compared as the union it denotes, not as the seven characters of its name.
+
+## Which conventions this follows
+
+The rules are not invented here; they are the ones the Julia community has
+written down, and each is verifiable:
+
+- **Version arithmetic** follows [ColPrac](https://github.com/SciML/ColPrac)
+  verbatim — "Post-1.0.0: for breaking changes increment X, for non-breaking new
+  features increment Y, for bug-fixes increment Z. Pre-1.0.0: for breaking
+  changes increment Y, for non-breaking (feature or bug-fix) increment Z." Below
+  `1.0`, features and fixes therefore share the patch digit, and `0.0.z` treats
+  every change as breaking — matching
+  [Pkg's compat rules](https://pkgdocs.julialang.org/v1/compatibility/), where
+  `^0.4.2` means `[0.4.2, 0.5.0)` and `^0.0.3` means `[0.0.3, 0.0.4)`.
+- **Public API** means names that are exported or declared `public`, which is
+  ColPrac's own definition.
+- **Adding an export is never breaking**, per ColPrac; it is reported as a
+  feature.
+- **Adding a supertype in a hierarchy is not breaking.** A supertype change is
+  only reported when the type no longer satisfies the old one, which is a real
+  `<:` check rather than a comparison of names.
+- **Introducing a deprecation is not breaking; removing one is.** This falls out
+  of the method comparison without a special case.
+- **Struct fields are not compared.** Julia convention treats a struct's fields
+  and their types as an implementation detail — `propertynames` is the
+  documented interface — so diffing the layout would report private churn as a
+  breaking change. What callers depend on is the *constructor*, so that is what
+  is compared. A layout change that does reach callers still surfaces there:
+  adding a field to a struct with the generated constructor turns `S(a, b)` into
+  `S(a, b, c)`, while adding one behind an explicit inner constructor correctly
+  changes nothing.
+
+The check also warns when a version is bumped *far enough but not by a standard
+increment*. [RegistryCI's AutoMerge](https://juliaregistries.github.io/RegistryCI.jl/stable/guidelines/)
+requires "a standard increment and not skip versions", so `1.2.3` → `1.5.0` is
+rejected at registration even though it clearly covers a minor change. That is a
+note, not a failure — the version is not too low.
 
 ## Installation
 
@@ -145,12 +182,21 @@ Two things are deliberately out of reach:
 
 - **Required vs optional keyword arguments.** The method table records keyword
   *names* but not their defaults, so a newly *required* keyword is reported as
-  `minor`, not `major`.
+  `minor`, not `major`. ColPrac would call that breaking.
 - **Methods from modules the package cannot see.** A generic function is shared
   by everyone who extends it, so `methods(f)` includes methods from unrelated
   co-loaded packages. Only methods defined by the package itself or by something
   it has bound (`using Foo` — which is what makes reexports work) count as its
   surface.
+
+One more thing is excluded on purpose. Julia generates *two* constructors for a
+struct with typed fields — `S(::Int)` and `S(::Any)`, the latter calling
+`convert` — and the untyped one accepts anything. Counting it would make the
+whole question vacuous: a deleted `S(::String)` would still look reachable,
+because `S(::Any)` swallows the call and only then fails inside `convert`. It is
+identified by shape (all-`Any` arguments, one per field, sharing a source line
+with a sibling that spells the field types out) and left out of the comparison.
+A hand-written untyped constructor lives on its own line and is kept.
 
 ## Prerelease versions
 

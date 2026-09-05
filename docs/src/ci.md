@@ -250,6 +250,19 @@ Every line names the change that drove the verdict and where it lives, so you
 can decide whether the break was intentional. If it was, bump to the suggested
 version. If it was not, the report has just caught a regression.
 
+Notes appear alongside a passing verdict when something is worth knowing but is
+not a reason to fail:
+
+```
+✓ Foo: v1.5.0 already covers the minor change since v1.2.3
+    [note] 1.5.0 is not a standard increment from 1.2.3; the registry accepts
+           only 1.2.4, 1.3.0 or 2.0.0
+```
+
+That one catches a version that is bumped far enough but will still be rejected
+by AutoMerge for skipping versions — better found in review than at release.
+Notes are emitted as `::notice` annotations on GitHub.
+
 Three verdicts are informational rather than failures:
 
 - `unregistered` — the package is not in any reachable registry, so there is
@@ -257,7 +270,11 @@ Three verdicts are informational rather than failures:
 - `no_version` — `Project.toml` has no `version` field.
 - `error` — the released version could not be installed or loaded, or the
   working tree could not be. The message says which, and `--logdir` keeps the
-  subprocess output that explains it. These surface as `::warning` annotations on
+  subprocess output that explains it. One case worth recognising: if a
+  working-tree version has outgrown a sibling's `[compat]` bound — which happens
+  precisely while you are doing what this tool asked — the set no longer resolves
+  together. The environment is then rebuilt one package at a time, so only the
+  package carrying the stale bound loses its verdict, and its message says so. These surface as `::warning` annotations on
   GitHub, so an unloadable package or a package-server outage does not fail your
   build.
 

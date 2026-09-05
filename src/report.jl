@@ -63,7 +63,7 @@ function print_report(io::IO, reports::Vector{PackageReport}; verbose::Bool=fals
                       color::Bool=get(io, :color, false), max_changes::Int=12)
     _c(s, c) = color ? sprint((o, x) -> printstyled(o, x; color=c, bold=(c === :red)), s; context=io) : s
     for r in reports
-        r.status === :ok && !verbose && r.level == NoChange && continue
+        r.status === :ok && !verbose && r.level == NoChange && isempty(r.notes) && continue
         mark = _STATUS_MARK[r.status]
         col = _STATUS_COLOR[r.status]
         println(io, _c("$(mark) ", col), summary_line(r))
@@ -78,10 +78,8 @@ function print_report(io::IO, reports::Vector{PackageReport}; verbose::Bool=fals
                 println(io, "    … and $(length(r.changes) - length(shown)) more change(s)")
             end
         end
-        if verbose
-            for e in r.notes
-                println(io, "    ", _c("[note]", :yellow), " ", e)
-            end
+        for e in r.notes
+            println(io, "    ", _c("[note]", :yellow), " ", e)
         end
     end
     n_bad = count(r -> r.status === :needs_bump, reports)
@@ -121,6 +119,9 @@ function print_github_annotations(io::IO, reports::Vector{PackageReport}; root::
             println(io, "::error file=$(file),line=$(line),title=Version bump needed::$(_gha_escape(body))")
         elseif r.status === :error
             println(io, "::warning file=$(file),line=$(line),title=SemverChecker::$(_gha_escape(r.message))")
+        end
+        for note in r.notes
+            println(io, "::notice file=$(file),line=$(line),title=SemverChecker::$(_gha_escape(note))")
         end
     end
 end

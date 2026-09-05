@@ -170,27 +170,32 @@ function describe_type(@nospecialize(v))
     d["nparams"] = length(base.parameters)
     d["module"] = string(base.name.module)
     d["supertype"] = qualify(supertype(base))
-    if isstructtype(base)
-        d["fields"] = Any[Any[string(f), qualify(t)]
-                          for (f, t) in zip(fieldnames(base), fieldtypes(base))]
-    end
     if isprimitivetype(base)
         d["nbits"] = 8 * sizeof(base)
     end
+    # A type's *constructors* are its public interface; its field layout is an
+    # implementation detail that callers are not supposed to rely on (see the
+    # note on `_compare_type!`).  Recording constructors also means a change of
+    # layout is still caught whenever it actually reaches callers, because the
+    # default constructor's signature changes with it.
+    d["constructors"] = _entries(constructor_methods(v, parentmodule(base)))
     return d
 end
 
-function describe_function(@nospecialize(v), M::Module)
-    ms = Dict{String,Any}[]
-    for m in methods(v)
-        is_stdlib_module(m.module) && continue
-        is_visible_from(m.module, M) || continue
+"""
+    _entries(ms) -> Vector{Dict}
+
+Render a list of `Method`s as plain data.
+"""
+function _entries(ms)
+    out = Dict{String,Any}[]
+    for m in ms
         kw = try
             String[string(k) for k in Base.kwarg_decl(m)]
         catch
             String[]
         end
-        push!(ms, Dict{String,Any}(
+        push!(out, Dict{String,Any}(
             "sig" => qualify(m.sig),
             "kwargs" => sort!(kw),
             "file" => string(m.file),
@@ -198,9 +203,75 @@ function describe_function(@nospecialize(v), M::Module)
             "module" => string(m.module),
         ))
     end
-    sort!(ms; by = m -> m["sig"])
-    return Dict{String,Any}("kind" => "function", "methods" => ms)
+    sort!(out; by = m -> m["sig"])
+    return out
 end
+
+"""
+    own_methods(callable, M) -> Vector{Method}
+
+The methods of `callable` that belong to `M`'s surface.
+"""
+own_methods(@nospecialize(v), M::Module) =
+    [m for m in methods(v) if !is_stdlib_module(m.module) && is_visible_from(m.module, M)]
+
+_method_entries(@nospecialize(v), M::Module) = _entries(own_methods(v, M))
+
+"""
+    _sig_args(sig) -> Vector
+
+The argument types of a method signature, dropping the callee slot.
+"""
+function _sig_args(@nospecialize(sig))
+    s = Base.unwrap_unionall(sig)
+    s isa DataType || return Any[]
+    return Any[s.parameters[i] for i in 2:length(s.parameters)]
+end
+
+"""
+    is_generated_fallback(T, m, siblings) -> Bool
+
+Whether `m` is the converting constructor the compiler generates for a struct
+with typed fields.
+
+Julia emits two constructors for `struct S; a::Int; end`: `S(::Int)`, and
+`S(::Any)` which calls `convert`. The second accepts *anything*, so counting it
+when asking "is this released constructor still callable?" makes the question
+vacuous — `S(::String)` looks alive long after it was deleted, because `S(::Any)`
+swallows the call and only then fails inside `convert`. Worse, it hides every
+field *type* change, since `S(::Any)` covers the old typed signature too.
+
+It is identified by shape rather than guessed at: all-`Any` arguments, one per
+field, sharing a source location with a sibling constructor that spells the
+field types out. A hand-written untyped constructor lives on its own line and is
+therefore kept.
+"""
+function is_generated_fallback(@nospecialize(T), m, siblings)
+    (T isa DataType && isstructtype(T)) || return false
+    n = fieldcount(T)
+    n == 0 && return false
+    args = _sig_args(m.sig)
+    (length(args) == n && all(a -> a === Any, args)) || return false
+    return any(siblings) do other
+        other === m && return false
+        other.file == m.file && other.line == m.line || return false
+        oargs = _sig_args(other.sig)
+        length(oargs) == n && any(a -> a !== Any, oargs)
+    end
+end
+
+"""
+    constructor_methods(T, M) -> Vector{Method}
+
+`T`'s constructors, minus the compiler's converting fallback.
+"""
+function constructor_methods(@nospecialize(T), M::Module)
+    ms = own_methods(T, M)
+    return [m for m in ms if !is_generated_fallback(T, m, ms)]
+end
+
+describe_function(@nospecialize(v), M::Module) =
+    Dict{String,Any}("kind" => "function", "methods" => _method_entries(v, M))
 
 # ---------------------------------------------------------------------------
 # Comparison — runs in the process where the NEW version is loaded
@@ -343,52 +414,65 @@ any special-casing.
 function _compare_function!(changes, M::Module, n, oe::Dict, ne::Dict)
     f = _resolve(M, n)
     f === nothing && return
-    new_methods = [m for m in methods(f)
-                   if !is_stdlib_module(m.module) && is_visible_from(m.module, M)]
-    new_sigs = Any[m.sig for m in new_methods]
+    new_methods = own_methods(f, M)
+    _compare_methodset!(changes, n, oe["methods"], new_methods, "method")
+    _compare_kwargs!(changes, n, oe, ne, "methods", "keyword argument")
+end
 
+"""
+    _compare_methodset!(changes, name, old_entries, new_methods, noun)
+
+Ask Julia, for every method the released version had, whether a call it accepted
+is still dispatched: `S_old <: m.sig` for some current method.  This is the real
+dispatch rule, so widening (`Int` → `Integer`, growing a `Union`, loosening a
+type parameter's bound) is recognised as non-breaking without special-casing.
+
+Used for both plain functions and constructors, which differ only in wording.
+"""
+function _compare_methodset!(changes, name, old_entries, new_methods, noun::String)
+    new_sigs = Any[m.sig for m in new_methods]
     old_sigs = Any[]
-    for om in oe["methods"]
+    for om in old_entries
         S, ok = tryeval(om["sig"])
         if !ok
-            push!(changes, _change(MAJOR, "signature_unresolvable", n,
-                                   "a type named by the released signature `$(_pretty(om["sig"]))` " *
-                                   "no longer exists"))
+            push!(changes, _change(MAJOR, "signature_unresolvable", name,
+                                   "a type named by the released $(noun) " *
+                                   "`$(_pretty(om["sig"]))` no longer exists"))
             continue
         end
         push!(old_sigs, S)
         if !any(s -> S <: s, new_sigs)
-            push!(changes, _change(MAJOR, "method_removed", n,
-                                   "no method accepts `$(_pretty(om["sig"]))` any more"))
+            push!(changes, _change(MAJOR, "$(noun)_removed", name,
+                                   "no $(noun) accepts `$(_pretty(om["sig"]))` any more"))
         end
     end
     for m in new_methods
         any(S -> m.sig <: S, old_sigs) && continue
-        push!(changes, _change(MINOR, "method_added", n,
-                               "new method `$(_pretty(qualify(m.sig)))`",
+        push!(changes, _change(MINOR, "$(noun)_added", name,
+                               "new $(noun) `$(_pretty(qualify(m.sig)))`",
                                string(m.file, ":", m.line)))
     end
-    _compare_kwargs!(changes, n, oe, ne)
+    return nothing
 end
 
-function _compare_kwargs!(changes, n, oe::Dict, ne::Dict)
+function _compare_kwargs!(changes, n, oe::Dict, ne::Dict, key::String, noun::String)
     oldkw = Set{String}(); newkw = Set{String}()
-    for m in oe["methods"]; union!(oldkw, m["kwargs"]); end
-    for m in ne["methods"]; union!(newkw, m["kwargs"]); end
+    for m in get(oe, key, Any[]); union!(oldkw, m["kwargs"]); end
+    for m in get(ne, key, Any[]); union!(newkw, m["kwargs"]); end
     # `kwargs...` absorbs anything, so a slurping method removes nothing.
     slurps = any(endswith(k, "...") for k in newkw)
     for k in sort!(collect(setdiff(oldkw, newkw)))
         endswith(k, "...") && continue
         slurps && continue
         push!(changes, _change(MAJOR, "kwarg_removed", n,
-                               "keyword argument `$(k)` of `$(n)` was removed"))
+                               "$(noun) `$(k)` of `$(n)` was removed"))
     end
     for k in sort!(collect(setdiff(newkw, oldkw)))
         endswith(k, "...") && continue
         # The method table records keyword *names* but not their defaults, so we
         # cannot tell a new required keyword from a new optional one.
         push!(changes, _change(MINOR, "kwarg_added", n,
-                               "new keyword argument `$(k)` on `$(n)`"))
+                               "new $(noun) `$(k)` on `$(n)`"))
     end
 end
 
@@ -422,7 +506,20 @@ function _compare_type!(changes, M::Module, n, oe::Dict, ne::Dict)
                                    "(now `$(_pretty(ne["supertype"]))`)"))
         end
     end
-    haskey(oe, "fields") && haskey(ne, "fields") && _compare_fields!(changes, M, n, oe, ne)
+    # Deliberately *not* compared: the field list.  Julia convention treats a
+    # struct's fields and their types as an implementation detail that callers
+    # should not rely on — `propertynames` is the documented interface — so
+    # diffing the layout reports private churn as a breaking change.  What
+    # callers actually depend on is the constructor, and a layout change that
+    # does reach them shows up there: adding a field to a struct with the
+    # generated constructor turns `S(a, b)` into `S(a, b, c)`, while adding one
+    # behind an explicit inner constructor rightly changes nothing.
+    T = _resolve(M, n)
+    if T isa Type
+        new_ctors = constructor_methods(T, M)
+        _compare_methodset!(changes, n, get(oe, "constructors", Any[]), new_ctors, "constructor")
+        _compare_kwargs!(changes, n, oe, ne, "constructors", "constructor keyword")
+    end
 end
 
 function _compare_union!(changes, M::Module, n, oe::Dict, ne::Dict)
@@ -439,63 +536,62 @@ function _compare_union!(changes, M::Module, n, oe::Dict, ne::Dict)
     end
 end
 
-function _compare_fields!(changes, M::Module, n, oe::Dict, ne::Dict)
-    ofields, nfields = oe["fields"], ne["fields"]
-    onames = [String(f[1]) for f in ofields]
-    nnames = [String(f[1]) for f in nfields]
-
-    for (i, f) in enumerate(onames)
-        f in nnames && continue
-        push!(changes, _change(MAJOR, "field_removed", n,
-                               "`$(n)` lost field `$(f)::$(_pretty(ofields[i][2]))`"))
-    end
-    for (i, f) in enumerate(nnames)
-        f in onames && continue
-        push!(changes, _change(MAJOR, "field_added", n,
-                               "`$(n)` gained field `$(f)::$(_pretty(nfields[i][2]))` " *
-                               "(changes the layout and the default constructor)"))
-    end
-    if length(onames) == length(nnames) && onames != nnames && sort(onames) == sort(nnames)
-        push!(changes, _change(MAJOR, "fields_reordered", n,
-                               "`$(n)` fields reordered: $(join(onames, ", ")) → $(join(nnames, ", "))"))
-    end
-    for (i, of) in enumerate(ofields)
-        j = findfirst(==(String(of[1])), nnames)
-        j === nothing && continue
-        ot, nt = String(of[2]), String(nfields[j][2])
-        ot == nt && continue
-        # Naming the direction makes the report actionable: a narrowed field
-        # breaks writers, a widened one breaks readers.
-        To, ok1 = tryeval(ot)
-        Tn, ok2 = tryeval(nt)
-        dir = if ok1 && ok2
-            Tn <: To ? " (narrowed)" : To <: Tn ? " (widened)" : ""
-        else
-            ""
-        end
-        push!(changes, _change(MAJOR, "field_type_changed", n,
-                               "`$(n).$(of[1])` type changed: `$(_pretty(ot))` → `$(_pretty(nt))`$(dir)"))
-    end
-end
-
 """
     _pretty(s) -> String
 
-Strip the noise that full qualification adds, for display only.  Comparisons
-always use the fully-qualified form.
+Strip the noise that full qualification adds, and render a signature the way a
+caller would write it.  Display only — comparisons always use the fully
+qualified form.
 """
 function _pretty(s::AbstractString)
     s = replace(s, "Core." => "", "Base." => "")
-    # A signature may be a UnionAll; keep the `where` clause off to one side
-    # while rewriting the tuple, then put it back.
+    # A signature may be a UnionAll; set the `where` clause aside while
+    # rewriting the tuple, then put it back.
     where_clause = ""
     m0 = match(r"^(.*?)( where .*)$", s)
     if m0 !== nothing
         s, where_clause = String(m0[1]), String(m0[2])
     end
-    m = match(r"^Tuple\{typeof\(([^)]*)\)(?:, )?(.*)\}$", s)
-    m === nothing && return s * where_clause
-    return string(m[1], "(", m[2], ")", where_clause)
+    call = _split_call(s)
+    call === nothing && return s * where_clause
+    callee, args = call
+    return string(callee, "(", args, ")", where_clause)
+end
+
+"""
+    _split_call(s) -> (callee, args) | nothing
+
+Split `Tuple{typeof(f), A, B}` (a method) or `Tuple{Type{T}, A, B}` (a
+constructor) into the thing being called and its argument list.
+
+The scan tracks brace depth rather than using a regex, because the callee can
+itself contain commas and braces, as in `Tuple{Type{P{T,U}}, T}`.
+"""
+function _split_call(s::AbstractString)
+    (startswith(s, "Tuple{") && endswith(s, "}")) || return nothing
+    body = s[7:prevind(s, lastindex(s))]
+    depth = 0
+    comma = 0
+    for (i, c) in pairs(body)
+        if c == '{' || c == '('
+            depth += 1
+        elseif c == '}' || c == ')'
+            depth -= 1
+        elseif c == ',' && depth == 0
+            comma = i
+            break
+        end
+    end
+    head = strip(comma == 0 ? body : body[1:prevind(body, comma)])
+    args = comma == 0 ? "" : strip(body[nextind(body, comma):end])
+    callee = if startswith(head, "typeof(") && endswith(head, ")")
+        head[8:prevind(head, lastindex(head))]
+    elseif startswith(head, "Type{") && endswith(head, "}")
+        head[6:prevind(head, lastindex(head))]
+    else
+        return nothing
+    end
+    return (callee, args)
 end
 
 # ---------------------------------------------------------------------------
@@ -555,14 +651,8 @@ working-tree paths and diff them against the recorded surfaces).
 function run_request(req::Dict)
     out = Dict{String,Any}()
     specs = req["specs"]
-    if req["mode"] == "dump"
-        _activate(() -> Pkg.add([Pkg.PackageSpec(name = s["name"],
-                                                 version = VersionNumber(s["version"]))
-                                 for s in specs]), specs, out)
-    else
-        _activate(() -> Pkg.develop([Pkg.PackageSpec(path = s["path"]) for s in specs]),
-                  specs, out)
-    end
+    _setup(req["mode"], specs, out)
+
     # Load *everything* before extracting anything.  A generic function's method
     # table grows as packages are loaded, so a surface taken mid-way through the
     # loop would depend on load order — and the two sides of the comparison would
@@ -598,35 +688,50 @@ function run_request(req::Dict)
 end
 
 """
-    _activate(setup, specs, out)
+    _setup(mode, specs, out)
 
-Resolve the whole set in one environment, which is what makes a monorepo cost
-two loads rather than two per package.  If the set cannot resolve together, fall
-back to one environment per package so that a single bad package does not sink
-the run.
+Put every package into one environment: all the registered versions for `dump`,
+all the working-tree paths for `compare`.  Resolving the set together is what
+makes a monorepo cost two loads rather than two per package.
+
+If the set will not resolve together — which happens exactly when a working-tree
+version has outgrown a sibling's compat bound, i.e. while the developer is in
+the middle of doing what this tool asked — the environment is rebuilt one
+package at a time so that the one package at fault is the only one that loses
+its verdict.
 """
-function _activate(setup, specs, out)
+function _setup(mode::AbstractString, specs, out)
     Pkg.activate(; temp = true, io = devnull)
     try
-        setup()
+        _setup_all(mode, specs)
         return
     catch e
-        @debug "batch resolution failed, falling back to per-package" exception = e
+        @debug "batch resolution failed; adding packages one at a time" exception = e
     end
+    Pkg.activate(; temp = true, io = devnull)
     for s in specs
-        Pkg.activate(; temp = true, io = devnull)
         try
-            if haskey(s, "path")
-                Pkg.develop(Pkg.PackageSpec(path = s["path"]); io = devnull)
-            else
-                Pkg.add(Pkg.PackageSpec(name = s["name"],
-                                        version = VersionNumber(s["version"])); io = devnull)
-            end
+            _setup_one(mode, s)
         catch e
             out[s["name"]] = Dict{String,Any}(
-                "error" => "could not resolve: " * first(sprint(showerror, e), 300))
+                "error" => "could not be resolved alongside the other packages " *
+                           "(a compat bound may need updating too): " *
+                           first(sprint(showerror, e), 300))
         end
     end
+    return nothing
+end
+
+_spec(s) = haskey(s, "path") ? Pkg.PackageSpec(path = s["path"]) :
+           Pkg.PackageSpec(name = s["name"], version = VersionNumber(s["version"]))
+
+function _setup_all(mode::AbstractString, specs)
+    specs_ = [_spec(s) for s in specs]
+    mode == "dump" ? Pkg.add(specs_; io = devnull) : Pkg.develop(specs_; io = devnull)
+end
+
+function _setup_one(mode::AbstractString, s)
+    mode == "dump" ? Pkg.add(_spec(s); io = devnull) : Pkg.develop(_spec(s); io = devnull)
 end
 
 function main()

@@ -84,26 +84,27 @@ end
                  :(export f; f(x::Int) = x))
     @test haskind(ch, "signature_unresolvable")
 
+    # A layout change that reaches callers does so through the constructor.
     ch = apidiff(:(export S; struct S; a::Int; b::Int; end),
                  :(export S; struct S; a::Int; end))
-    @test haskind(ch, "field_removed")
+    @test haskind(ch, "constructor_removed")
 
     ch = apidiff(:(export S; struct S; a::Int; end),
                  :(export S; struct S; a::Int; b::Int; end))
-    @test haskind(ch, "field_added")
+    @test haskind(ch, "constructor_removed")
 
     ch = apidiff(:(export S; struct S; a::Int; b::Int; end),
-                 :(export S; struct S; b::Int; a::Int; end))
-    @test haskind(ch, "fields_reordered")
+                 :(export S; struct S; b::String; a::Int; end))
+    @test haskind(ch, "constructor_removed")
 
     ch = apidiff(:(export S; struct S; a::Int; end),
-                 :(export S; struct S; a::Float64; end))
-    @test haskind(ch, "field_type_changed")
+                 :(export S; struct S; a::String; end))
+    @test haskind(ch, "constructor_removed")
 
-    # The report says which direction a field moved.
-    ch = apidiff(:(export S; struct S; a::Int; end),
-                 :(export S; struct S; a::Union{Nothing,Int}; end))
-    @test occursin("widened", detail(ch, "field_type_changed"))
+    # Removing a constructor is breaking even when the layout is untouched.
+    ch = apidiff(:(export S; struct S; a::Int; end; S(x::String) = S(parse(Int, x))),
+                 :(export S; struct S; a::Int; end))
+    @test haskind(ch, "constructor_removed")
 
     ch = apidiff(:(export S; struct S; a::Int; end),
                  :(export S; mutable struct S; a::Int; end))
@@ -131,6 +132,68 @@ end
     # Collapsing a union to a concrete type is a change of form.
     ch = apidiff(:(export U; const U = Union{Int,String}), :(export U; const U = Int))
     @test haskind(ch, "type_form_changed") && worst(ch) == "major"
+end
+
+@testset "struct fields are implementation details" begin
+    # Julia convention: a struct's fields are private, its constructors are the
+    # API.  A field added behind an explicit inner constructor changes nothing
+    # a caller can observe, so it must not be reported.
+    ch = apidiff(:(export S; struct S; a::Int; S(x::String) = new(parse(Int, x)); end),
+                 :(export S; struct S; a::Int; b::Float64; S(x::String) = new(parse(Int, x), 0.0); end))
+    @test isempty(ch)
+
+    # Renaming a private field, likewise.
+    ch = apidiff(:(export S; struct S; a::Int; S() = new(1); end),
+                 :(export S; struct S; renamed::Int; S() = new(1); end))
+    @test isempty(ch)
+
+    # A `@kwdef` field with a default adds a keyword — but `@kwdef` also emits
+    # positional constructors, so `S(1)` really does stop working. Both are
+    # reported, and the developer can see which one they care about.
+    ch = apidiff(:(export S; Base.@kwdef struct S; a::Int = 1; end),
+                 :(export S; Base.@kwdef struct S; a::Int = 1; b::Float64 = 2.0; end))
+    @test haskind(ch, "kwarg_added")
+    @test haskind(ch, "constructor_removed")
+
+    # A field type that *widens* keeps every construction working.
+    ch = apidiff(:(export S; struct S; a::Int; end),
+                 :(export S; struct S; a::Union{Nothing,Int}; end))
+    @test !haskind(ch, "constructor_removed")
+
+    # ...and one that narrows does not.
+    ch = apidiff(:(export S; struct S; a::Union{Nothing,Int}; end),
+                 :(export S; struct S; a::Int; end))
+    @test haskind(ch, "constructor_removed")
+
+    # A struct with no typed fields has no converting fallback to exclude, so
+    # its single generated constructor is still the real contract.
+    ch = apidiff(:(export S; struct S; a; end), :(export S; struct S; a; b; end))
+    @test haskind(ch, "constructor_removed")
+end
+
+@testset "generated converting constructor" begin
+    # `struct S; a::Int; end` emits S(::Int) and S(::Any); the latter accepts
+    # anything and would mask every field-type change if it were counted.
+    @eval module FB
+        struct S; a::Int; end
+        S(x::String) = S(parse(Int, x))
+        struct AllAny; a; end
+        struct NoFields end
+    end
+    ms = SemverWorker.own_methods(FB.S, FB)
+    fallbacks = [m for m in ms if SemverWorker.is_generated_fallback(FB.S, m, ms)]
+    @test length(fallbacks) == 1
+    @test SemverWorker._sig_args(only(fallbacks).sig) == Any[Any]
+    # The hand-written S(::String) and the typed S(::Int) both survive.
+    kept = SemverWorker.constructor_methods(FB.S, FB)
+    @test length(kept) == 2
+    @test Set(SemverWorker._sig_args(m.sig)[1] for m in kept) == Set([Int, String])
+
+    # Nothing to exclude when there is no typed sibling, or no fields at all.
+    @test length(SemverWorker.constructor_methods(FB.AllAny, FB)) ==
+          length(SemverWorker.own_methods(FB.AllAny, FB))
+    @test length(SemverWorker.constructor_methods(FB.NoFields, FB)) ==
+          length(SemverWorker.own_methods(FB.NoFields, FB))
 end
 
 @testset "minor changes" begin
@@ -246,6 +309,20 @@ end
     @test Set(basename.(found)) == Set(["A", "B"])
 end
 
+@testset "standard increments" begin
+    # RegistryCI accepts exactly one +1 step on patch, minor or major.
+    @test SemverChecker.standard_increments(v"1.2.3") == [v"1.2.4", v"1.3.0", v"2.0.0"]
+    @test SemverChecker.standard_increments(v"0.4.2") == [v"0.4.3", v"0.5.0", v"1.0.0"]
+
+    @test SemverChecker.is_standard_increment(v"1.2.3", v"1.3.0")
+    @test SemverChecker.is_standard_increment(v"1.2.3", v"2.0.0")
+    @test SemverChecker.is_standard_increment(v"1.2.3", v"1.3.0-DEV")
+    # Above the minimum, but the registry will refuse it.
+    @test !SemverChecker.is_standard_increment(v"1.2.3", v"1.5.0")
+    @test !SemverChecker.is_standard_increment(v"0.4.2", v"0.7.0")
+    @test is_sufficient(v"1.2.3", v"1.5.0", Minor)   # ...yet still "bumped enough"
+end
+
 @testset "reporting" begin
     rv = SemverChecker.RegisteredVersion("Demo", UUIDs.uuid4(), v"1.0.0", "General")
     reports = [SemverChecker.PackageReport(
@@ -266,6 +343,15 @@ end
 
     json = sprint(io -> SemverChecker.print_json(io, reports))
     @test occursin("\"ok\":false", json) && occursin("\"minimum_version\":\"2.0.0\"", json)
+
+    # Notes are shown without --verbose, and annotated as notices on GitHub.
+    noted = [SemverChecker.PackageReport(
+        "Noted", "Noted", v"1.5.0", rv, Minor, Change[], v"1.3.0", :ok, "",
+        ["1.5.0 is not a standard increment from 1.2.3"])]
+    text = sprint(io -> SemverChecker.print_report(io, noted))
+    @test occursin("not a standard increment", text)
+    gha = sprint(io -> SemverChecker.print_github_annotations(io, noted))
+    @test occursin("::notice", gha)
 end
 
 @testset "apply_bumps!" begin

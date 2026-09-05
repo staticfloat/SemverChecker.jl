@@ -86,6 +86,34 @@ function overall_level(changes::Vector{Change}, changed::Bool)
 end
 
 """
+    standard_increments(v::VersionNumber) -> Vector{VersionNumber}
+
+The versions the General registry accepts as the next release after `v`.
+
+RegistryCI's AutoMerge requires "a standard increment and not skip versions":
+exactly one of the patch, minor or major components goes up by one and the
+lesser ones reset.  Anything else — `1.2.3` → `1.5.0`, say — blocks automatic
+merging even though it is comfortably *above* the minimum a change requires.
+"""
+standard_increments(v::VersionNumber) = [
+    VersionNumber(v.major, v.minor, v.patch + 1),
+    VersionNumber(v.major, v.minor + 1, 0),
+    VersionNumber(v.major + 1, 0, 0),
+]
+
+"""
+    is_standard_increment(registered, current; allow_prerelease=true) -> Bool
+
+Whether `current` is one of the increments AutoMerge will accept over
+`registered`.
+"""
+function is_standard_increment(registered::VersionNumber, current::VersionNumber;
+                               allow_prerelease::Bool=true)
+    cur = allow_prerelease ? _strip_prerelease(current) : current
+    return cur in standard_increments(registered)
+end
+
+"""
     Change(d::AbstractDict)
 
 Rebuild a [`Change`](@ref) from the plain-data form the worker subprocess

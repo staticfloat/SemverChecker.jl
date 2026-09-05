@@ -256,6 +256,15 @@ function _assemble(p::_Pkg, rv, oldsurf, newsurf, allow_prerelease)
     minimum_version = bump_version(rv.version, level)
     ok = is_sufficient(rv.version, p.version, level; allow_prerelease)
 
+    # A version can clear the bar and still be un-registrable: the registry only
+    # accepts a single standard increment, so over-bumping fails at merge time.
+    # Worth saying now rather than letting the developer find out at release.
+    if ok && level != NoChange && !is_standard_increment(rv.version, p.version; allow_prerelease)
+        push!(notes, "$(p.version) is not a standard increment from $(rv.version); " *
+                     "the registry accepts only " *
+                     join(string.(standard_increments(rv.version)), ", ", " or "))
+    end
+
     sort!(changes; rev=true)
     return PackageReport(p.name, p.relpath, p.version, rv, level, changes,
                          minimum_version, ok ? :ok : :needs_bump, "", notes)
