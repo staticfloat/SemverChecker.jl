@@ -1,7 +1,7 @@
 name = "SemverChecker"
 uuid = "6d5f8b7a-2c41-4e9d-9f3b-1a7c8e4d2b60"
 authors = ["Elliot Saba <staticfloat@gmail.com>"]
-version = "0.1.0"
+version = "1.0.0"
 
 [deps]
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
