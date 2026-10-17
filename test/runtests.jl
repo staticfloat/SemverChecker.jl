@@ -309,6 +309,27 @@ end
     @test Set(basename.(found)) == Set(["A", "B"])
 end
 
+@testset "dependency order" begin
+    dir = mktempdir()
+    uuid = Dict(n => string(UUIDs.uuid4()) for n in ["Leaf", "Mid", "Top", "Alone", "X", "Y"])
+    function pkg(name, deps; section="deps")
+        root = make_pkg(dir, name, ""; uuid=uuid[name])
+        open(joinpath(root, "Project.toml"), "a") do io
+            println(io, "\n[$(section)]")
+            foreach(d -> println(io, "$(d) = \"$(uuid[d])\""), deps)
+        end
+        return root
+    end
+    # Given in alphabetical order, i.e. the reverse of what is wanted.
+    dirs = [pkg("Alone", String[]), pkg("Top", ["Mid", "Leaf"]),
+            pkg("Mid", ["Leaf"]), pkg("Leaf", String[])]
+    @test basename.(SemverChecker.dependency_order(dirs)) == ["Alone", "Leaf", "Mid", "Top"]
+
+    # Dependencies outside the set are irrelevant; a cycle goes last, not lost.
+    dirs = [pkg("X", ["Y"]; section="weakdeps"), pkg("Y", ["X"]), dirs[2], dirs[4]]
+    @test basename.(SemverChecker.dependency_order(dirs)) == ["Leaf", "Top", "X", "Y"]
+end
+
 @testset "standard increments" begin
     # RegistryCI accepts exactly one +1 step on patch, minor or major.
     @test SemverChecker.standard_increments(v"1.2.3") == [v"1.2.4", v"1.3.0", v"2.0.0"]

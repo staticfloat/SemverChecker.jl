@@ -35,6 +35,48 @@ function discover_packages(root::AbstractString; skip=DEFAULT_SKIP)
     return found
 end
 
+"""
+    dependency_order(dirs) -> Vector{String}
+
+Reorder package directories so that each comes after every other package in
+`dirs` that it depends on (through `[deps]` or `[weakdeps]`): leaf packages
+first, then the packages built on top of them.  Reading a monorepo's report in
+this order puts a breaking change ahead of the siblings it may force to change.
+
+Ties keep their order in `dirs`.  Should the packages form a cycle (possible
+through weak dependencies), its members are placed after everything else, again
+in their original order.
+"""
+function dependency_order(dirs::AbstractVector{<:AbstractString})
+    uuids = Vector{Union{Nothing,String}}(nothing, length(dirs))
+    needs = [Set{String}() for _ in dirs]
+    for (i, d) in enumerate(dirs)
+        proj = try
+            TOML.parsefile(joinpath(d, "Project.toml"))
+        catch
+            continue
+        end
+        uuids[i] = get(proj, "uuid", nothing)
+        for section in ("deps", "weakdeps")
+            union!(needs[i], values(get(proj, section, Dict{String,Any}())))
+        end
+    end
+    local_uuids = Set(u for u in uuids if u !== nothing)
+    pending = [Set(x for x in n if x in local_uuids && x != u) for (n, u) in zip(needs, uuids)]
+
+    order = Int[]
+    placed = falses(length(dirs))
+    while true
+        i = findfirst(j -> !placed[j] && isempty(pending[j]), eachindex(dirs))
+        i === nothing && break
+        push!(order, i)
+        placed[i] = true
+        uuids[i] === nothing || foreach(p -> delete!(p, uuids[i]), pending)
+    end
+    append!(order, findall(!, placed))
+    return dirs[order]
+end
+
 function _is_package(dir::AbstractString)
     proj_path = joinpath(dir, "Project.toml")
     isfile(proj_path) || return false
@@ -132,7 +174,9 @@ end
 
 Scan the repository at `root` and report, for every package it contains,
 whether the version in `Project.toml` has been bumped enough to cover the
-changes made since the latest registered release.
+changes made since the latest registered release.  Reports come in dependency
+order (see [`dependency_order`](@ref)), so a monorepo's leaf packages are
+listed first.
 
 Both the released versions and the working tree are *loaded* — in two
 subprocesses, batched so that a monorepo costs two loads in total — and their
@@ -155,6 +199,9 @@ function check(root::AbstractString="."; packages=nothing, skip=DEFAULT_SKIP,
     root = abspath(root)
     dirs = packages === nothing ? discover_packages(root; skip) :
            [abspath(joinpath(root, p)) for p in packages]
+    dirs = dependency_order(dirs)
+    rank = Dict(relpath(d, root) => i for (i, d) in enumerate(dirs))
+    in_order!(reports) = sort!(reports; by = r -> get(rank, r.path, typemax(Int)))
     logdir = logdir === nothing ? mktempdir() : (mkpath(logdir); logdir)
 
     pkgs = _Pkg[]
@@ -176,7 +223,7 @@ function check(root::AbstractString="."; packages=nothing, skip=DEFAULT_SKIP,
         push!(pkgs, _Pkg(name, Base.UUID(proj["uuid"]),
                          VersionNumber(proj["version"]), d, rel))
     end
-    isempty(pkgs) && return reports
+    isempty(pkgs) && return in_order!(reports)
 
     # Which packages have a release to compare against?
     registered = Dict{String,RegisteredVersion}()
@@ -198,7 +245,7 @@ function check(root::AbstractString="."; packages=nothing, skip=DEFAULT_SKIP,
                                      "could not analyze released versions: $(resp["__fatal__"])",
                                      p.version, get(registered, p.name, nothing)))
             end
-            return reports
+            return in_order!(reports)
         end
         old = resp
     end
@@ -214,7 +261,7 @@ function check(root::AbstractString="."; packages=nothing, skip=DEFAULT_SKIP,
                                  "could not analyze the working tree: $(resp["__fatal__"])",
                                  p.version, get(registered, p.name, nothing)))
         end
-        return reports
+        return in_order!(reports)
     end
 
     for p in pkgs
@@ -222,8 +269,7 @@ function check(root::AbstractString="."; packages=nothing, skip=DEFAULT_SKIP,
                                  get(old, p.name, nothing), get(resp, p.name, nothing),
                                  allow_prerelease))
     end
-    sort!(reports; by = r -> r.name)
-    return reports
+    return in_order!(reports)
 end
 
 _bare(name, path, status, msg, ver=nothing, rv=nothing) =
